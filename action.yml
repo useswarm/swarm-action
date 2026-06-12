@@ -1,0 +1,28 @@
+name: "Swarm UX Test"
+description: "Run a Swarm AI UX test on your pull request."
+author: "Swarm"
+branding:
+  icon: "eye"
+  color: "yellow"
+inputs:
+  apiKey:
+    description: "Swarm API key (cli:run scope). Optional if the Swarm GitHub App is installed (auth via OIDC)."
+    required: false
+  apiUrl:
+    description: "Swarm API base URL."
+    required: false
+    default: "https://api.useswarm.co"
+  config:
+    description: "Path to the swarm config file."
+    required: false
+    default: "swarm.config.yml"
+  preview-url:
+    description: "Explicit preview URL to test (overrides config/auto-detect)."
+    required: false
+  githubToken:
+    description: "Token for posting comments + checks."
+    required: false
+    default: ${{ github.token }}
+runs:
+  using: "node20"
+  main: "dist/index.js"

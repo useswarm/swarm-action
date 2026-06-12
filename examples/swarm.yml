@@ -1,0 +1,46 @@
+name: Swarm UX Test
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  issue_comment:
+    types: [created]
+jobs:
+  swarm:
+    # Runs on PR events, or when a repo writer (owner/member/collaborator) comments
+    # `@swarm-ci run` on the PR — drive-by commenters can't trigger billable runs.
+    # (The legacy `/swarm run` command is still accepted.) With the GitHub App,
+    # whether PR events actually run a test is governed by the repo's run-mode
+    # (Swarm → Integrations): "automatic" runs on every PR open, "manual" only runs
+    # on a comment trigger. A `@swarm-ci run` comment always runs.
+    if: github.event_name == 'pull_request' || (github.event.issue.pull_request && (contains(github.event.comment.body, '@swarm-ci run') || contains(github.event.comment.body, '/swarm run')) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    # Job-level on purpose: bot comments (e.g. the Swarm bot's onboarding comment)
+    # fire issue_comment runs that the `if:` gate skips — a workflow-level group
+    # would cancel the in-flight PR run BEFORE the gate evaluates, leaving a
+    # spurious red "cancelled" check. Job-level concurrency only takes effect when
+    # the job actually runs, so new pushes / repeated `@swarm-ci run` still cancel
+    # stale in-flight runs while gate-skipped runs cancel nothing.
+    concurrency:
+      group: swarm-pr-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    # Backstop: the Action self-limits polling to ~25 min, but cap the job so a
+    # hung build/serve can never idle toward the 6h runner ceiling.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+      id-token: write   # for the Swarm GitHub App (OIDC) auth path; harmless if using apiKey
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On a `@swarm-ci run` comment the default checkout is the base branch; pin to the PR head.
+          ref: ${{ github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number) || github.ref }}
+      - uses: useswarm/swarm-action@v1
+        with:
+          # Omit `apiKey` when the Swarm GitHub App is installed — the Action
+          # authenticates via OIDC and pulls the personas/task you set up with `@swarm-ci`.
+          apiKey: ${{ secrets.SWARM_API_KEY }}
+        env:
+          SWARM_TEST_USERNAME: ${{ secrets.SWARM_TEST_USERNAME }}
+          SWARM_TEST_PASSWORD: ${{ secrets.SWARM_TEST_PASSWORD }}

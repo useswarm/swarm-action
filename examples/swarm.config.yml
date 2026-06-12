@@ -1,0 +1,77 @@
+# swarm.config.yml
+version: 1
+
+# ── What to test ──────────────────────────────────────────────
+goal: "Sign up for a new account and create a first project"   # plain-English objective
+# With the GitHub App, the goal you set conversationally via `@swarm-ci` on the PR
+# wins over this one — keep this as a fallback for direct apiKey use.
+
+# Personas — pick at most one source:
+#   • GitHub App (no apiKey): OMIT both blocks below. Personas are configured
+#     conversationally by commenting `@swarm-ci` on a PR (persona type, count, task),
+#     and the first PR won't run until you do. This is the recommended path.
+#   • Direct apiKey: provide EITHER generatePersonas (below) OR swarmId (a UUID
+#     from the dashboard). Providing both is an error.
+# swarmId: "00000000-0000-0000-0000-000000000000"
+generatePersonas:
+  agentCount: 3
+  audienceDescription: "First-time SaaS users evaluating the product on desktop"
+
+provider: anthropic               # optional: openai | anthropic
+# model: "claude-3-7-sonnet"      # optional model override (omit to use the default)
+maxSteps: 30                      # optional cap per agent
+
+# ── How to get a URL ──────────────────────────────────────────
+# By default (no preview URL), Swarm builds + serves your app in the runner using
+# the `build` block below, then exposes it via a Cloudflare tunnel.
+# To test an existing preview deployment instead, pass the `preview-url` action
+# input, or uncomment and set a concrete URL here:
+# preview:
+#   url: "https://my-app-pr-123.example.com"
+
+build:                            # used only when no preview URL is resolved
+  install: "pnpm install --frozen-lockfile"
+  command: "pnpm build"
+  start: "pnpm start"             # long-running; or set `serveDir` for static output
+  # serveDir: "dist"              # serve a static directory instead of `start`
+  port: 3000
+  # backendPort: 8080             # optional second port merged under backendPaths
+  backendPaths: ["/api", "/auth"] # extra path prefixes routed to backendPort
+  healthCheck:
+    path: "/"
+    timeoutSeconds: 120
+
+# ── Auth to the app under test ────────────────────────────────
+auth:
+  mode: agent_login               # agent_login | cookie_injection | none
+  loginUrl: "/login"
+  # Credentials are referenced as env names, injected by the workflow from GitHub secrets.
+  usernameEnv: SWARM_TEST_USERNAME
+  passwordEnv: SWARM_TEST_PASSWORD
+  # cookiesEnv: SWARM_TEST_COOKIES  # JSON array of cookies in this env var (cookie_injection)
+
+# ── Triggering / spend ────────────────────────────────────────
+# NOTE (GitHub App path): whether a PR runs automatically is controlled per-repo
+# in Swarm → Integrations — "automatic" (every PR open) or "manual" (only when
+# someone comments `@swarm-ci run`). It's "manual" by default. This is set in the
+# dashboard, not here, so the toggle takes effect without editing this file.
+#
+# NOTE: path filtering is NOT enforced by the Action. To only run on changes to
+# certain paths, gate the workflow itself with `on.pull_request.paths` in your
+# GitHub Actions YAML. The `paths` key below is currently informational/reserved
+# and has no effect on what the Action does.
+paths:                            # informational/reserved — see note above
+  - "apps/web/**"
+  - "src/**"
+
+# ── Gating (advisory by default) ──────────────────────────────
+gate:
+  block: false                    # false = advisory (neutral check, never fails the job)
+  failOn:
+    severityAtLeast: critical     # critical | high | medium | low
+    # Case-insensitive WHOLE-WORD match against the judge's plain-English verdict.
+    # The verdict is prose (e.g. "No — checkout is broken."), so list words that
+    # signal a failure — e.g. "no" or "broken". Any match fails the check ("no"
+    # matches "No — …" but not "notable").
+    judgeVerdict: ["no"]
+    # minUxScore: 70              # or fail if overallUxScore < N

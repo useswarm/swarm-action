@@ -44248,10 +44248,13 @@ async function startApp(cfg) {
         : {};
     if (cfg.install)
         runBlocking(cfg.install);
-    if (cfg.command)
-        runBlocking(cfg.command, backendEnv);
+    // Build the backend before the frontend: a full-stack frontend commonly imports
+    // generated types/artifacts from the API (shared types, an OpenAPI client, …), so the
+    // API build must run first. The frontend build then gets $BACKEND_URL/$BACKEND_PORT.
     if (cfg.backend?.command)
         runBlocking(cfg.backend.command);
+    if (cfg.command)
+        runBlocking(cfg.command, backendEnv);
     const stoppers = [];
     const stopAll = () => {
         // Tear down in reverse start order — app first, then backend.
@@ -44302,7 +44305,9 @@ function isTerminalStatus(status) {
 function judgeIsReady(judge) {
     if (!judge)
         return false;
-    if (judge.status === "completed" || judge.status === "failed")
+    // Any terminal judge status means "done" — kept in sync with isTerminalStatus so a
+    // (defensively) terminated judge doesn't hold the poller for the full finalize grace.
+    if (judge.status === "completed" || judge.status === "failed" || judge.status === "terminated")
         return true;
     if (judge.status == null) {
         return !!judge.verdict || (Array.isArray(judge.evidenceBlocks) && judge.evidenceBlocks.length > 0);

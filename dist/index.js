@@ -44200,6 +44200,22 @@ const TERMINAL = new Set(["completed", "failed", "terminated"]);
 function isTerminalStatus(status) {
     return TERMINAL.has(status);
 }
+/**
+ * The judge agent writes progressively: its row appears (status "pending"/"running")
+ * with null verdict/findings, then fills in over several LLM stages. "Ready" means the
+ * judge is actually done — a terminal status, or (for an older API that omits `status`)
+ * a verdict/findings have materialized. Returning before this yields an empty comment.
+ */
+function judgeIsReady(judge) {
+    if (!judge)
+        return false;
+    if (judge.status === "completed" || judge.status === "failed")
+        return true;
+    if (judge.status == null) {
+        return !!judge.verdict || (Array.isArray(judge.evidenceBlocks) && judge.evidenceBlocks.length > 0);
+    }
+    return false;
+}
 class SwarmClient {
     baseUrl;
     apiKey;
@@ -44279,7 +44295,7 @@ class SwarmClient {
         }
     }
     async pollUntilDone(batchId, opts) {
-        const finalizeGraceMs = opts.finalizeGraceMs ?? 120_000;
+        const finalizeGraceMs = opts.finalizeGraceMs ?? 240_000;
         const maxConsecutiveErrors = opts.maxConsecutiveErrors ?? 5;
         const deadline = Date.now() + opts.timeoutMs;
         let completedSince = null;
@@ -44305,10 +44321,13 @@ class SwarmClient {
             if (s === "failed" || s === "terminated")
                 return status;
             if (s === "completed") {
-                // The API flips status to "completed" BEFORE writing synthesis + judge
-                // (each a multi-second LLM step). Wait for findings rather than returning
-                // an empty snapshot, but cap the wait so a synthesis/judge failure can't hang us.
-                if (status.synthesis || status.judge)
+                // The API flips the batch to "completed" BEFORE the judge agent finishes — the
+                // judge is a multi-stage LLM pipeline that writes its verdict + findings
+                // progressively, so its row exists (and the API returns a non-null `judge`)
+                // while verdict/findings are still null. Wait for the judge to actually finish
+                // rather than rendering an empty comment, but cap the wait so a stuck/failed
+                // judge can't hang the job.
+                if (judgeIsReady(status.judge))
                     return status;
                 if (completedSince === null)
                     completedSince = Date.now();
@@ -44327,6 +44346,8 @@ class SwarmClient {
 
 ;// CONCATENATED MODULE: ./src/gate.ts
 const SEVERITY_RANK = { low: 1, medium: 2, high: 3, critical: 4 };
+// Evidence-block types the judge emits that are positive (not a problem to gate on).
+const POSITIVE_TYPES = new Set(["strength", "success_pattern"]);
 function gate_escapeRegExp(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -44340,10 +44361,15 @@ function evaluateGate(result, gate) {
     const { severityAtLeast, judgeVerdict, minUxScore } = gate.failOn;
     if (severityAtLeast) {
         const threshold = SEVERITY_RANK[severityAtLeast];
-        const tickets = result.synthesis?.tickets ?? [];
-        const breached = tickets.some((t) => t.severity && SEVERITY_RANK[t.severity] >= threshold);
+        const blocks = result.judge?.evidenceBlocks ?? [];
+        const breached = blocks.some((b) => {
+            if (POSITIVE_TYPES.has((b.type ?? "").toString()))
+                return false;
+            const sev = b.severity;
+            return !!sev && (SEVERITY_RANK[sev] ?? 0) >= threshold;
+        });
         if (breached)
-            reasons.push(`a ticket at severity ≥ ${severityAtLeast}`);
+            reasons.push(`a finding at severity ≥ ${severityAtLeast}`);
     }
     if (judgeVerdict && judgeVerdict.length > 0 && result.judge?.verdict) {
         // Whole-word match so e.g. token "no" doesn't fire on "notable"/"annoyances".
@@ -44373,8 +44399,36 @@ function evaluateGate(result, gate) {
 
 ;// CONCATENATED MODULE: ./src/render.ts
 const STICKY_MARKER = "<!-- swarm-ci-comment -->";
-const render_SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
-const SEVERITY_EMOJI = { critical: "🔴", high: "🟠", medium: "🟡", low: "⚪" };
+// Mirrors the dashboard's FindingsTable type pills (web: results/FindingsTable.tsx).
+const TYPE_LABEL = {
+    issue: { label: "Confirmed Issue", emoji: "🔴", order: 0 },
+    friction: { label: "Possible Friction", emoji: "🟡", order: 1 },
+    friction_point: { label: "Possible Friction", emoji: "🟡", order: 1 },
+    drop_off_risk: { label: "Possible Friction", emoji: "🟡", order: 1 },
+    insight: { label: "Observation", emoji: "⚪", order: 2 },
+    behavioral_insight: { label: "Observation", emoji: "⚪", order: 2 },
+    strength: { label: "Platform Strength", emoji: "🟢", order: 3 },
+    success_pattern: { label: "Platform Strength", emoji: "🟢", order: 3 },
+};
+// Mirrors the dashboard's CATEGORY_CONFIG labels (web: results/FindingsTable.tsx).
+const CATEGORY_LABEL = {
+    navigation: "Navigation",
+    copy: "Copy & Messaging",
+    visual_design: "Visual Design",
+    forms: "Forms & Input",
+    performance: "Performance",
+    trust: "Trust",
+    onboarding: "Onboarding",
+    search: "Search",
+    accessibility: "Accessibility",
+};
+const PRIORITY_LABEL = {
+    now: "🔴 Now",
+    soon: "🟠 Soon",
+    later: "⚪ Later",
+};
+const MAX_FINDINGS = 10;
+const MAX_ACTIONS = 4;
 function renderRunningComment(dashboardUrl) {
     return [
         STICKY_MARKER,
@@ -44399,36 +44453,80 @@ function renderResultComment({ dashboardUrl, result, gate }) {
             `This run was cancelled (e.g. superseded by a newer commit). [Open the run →](${dashboardUrl})`,
         ].join("\n");
     }
+    const judge = result.judge;
     const score = typeof result.overallUxScore === "number" ? `${result.overallUxScore}/100` : "—";
-    const verdict = (result.judge?.verdict ?? "—").replace(/`/g, "'");
+    const verdict = judge?.verdict?.trim();
+    const confidence = judge?.confidence ? titleCase(judge.confidence) : null;
     lines.push("### 🐝 Swarm UX results");
     lines.push("");
-    lines.push(`**UX score:** ${score}  ·  **Judge verdict:** \`${verdict}\``);
+    // Lead with the judge's verdict — the same sentence shown on the dashboard.
+    if (verdict) {
+        lines.push(`**Verdict:** ${escapeInline(verdict)}`);
+        lines.push("");
+    }
+    const meta = [`**UX score:** ${score}`];
+    if (confidence)
+        meta.push(`**Confidence:** ${confidence}`);
+    lines.push(meta.join("  ·  "));
     if (gate.reasons.length > 0) {
         const verb = gate.shouldFail ? "❌ Failing this check" : "⚠️ Advisory";
         lines.push("");
         lines.push(`${verb} — ${gate.reasons.join("; ")}.`);
     }
-    const tickets = [...(result.synthesis?.tickets ?? [])].sort((a, b) => (render_SEVERITY_RANK[b.severity ?? "low"] ?? 0) - (render_SEVERITY_RANK[a.severity ?? "low"] ?? 0));
+    const blocks = [...(judge?.evidenceBlocks ?? [])].sort((a, b) => (TYPE_LABEL[a.type ?? ""]?.order ?? 99) - (TYPE_LABEL[b.type ?? ""]?.order ?? 99));
     lines.push("");
-    if (tickets.length === 0) {
+    if (blocks.length === 0) {
         lines.push("No findings — agents completed the goal without notable issues. 🎉");
     }
     else {
-        lines.push("| | Severity | Issue | Recommendation |");
-        lines.push("|---|---|---|---|");
-        for (const t of tickets) {
-            const sev = (t.severity ?? "low").toString();
-            const emoji = SEVERITY_EMOJI[sev] ?? "⚪";
-            const title = t.title ?? "(untitled)";
-            const rec = t.recommendation ?? "";
-            lines.push(`| ${emoji} | ${sev} | ${escapeCell(title)} | ${escapeCell(rec)} |`);
+        const hasArea = blocks.some((b) => b.category);
+        lines.push(`**Findings (${blocks.length})**`);
+        lines.push("");
+        lines.push(hasArea ? "| Type | Finding | Area | Agents |" : "| Type | Finding | Agents |");
+        lines.push(hasArea ? "|---|---|---|---|" : "|---|---|---|");
+        for (const b of blocks.slice(0, MAX_FINDINGS)) {
+            lines.push(renderFindingRow(b, hasArea));
+        }
+        if (blocks.length > MAX_FINDINGS) {
+            lines.push("");
+            lines.push(`_…and ${blocks.length - MAX_FINDINGS} more — [see the full run →](${dashboardUrl})._`);
+        }
+    }
+    const actions = judge?.recommendedActions ?? [];
+    if (actions.length > 0) {
+        lines.push("");
+        lines.push("**Recommended actions**");
+        for (const a of actions.slice(0, MAX_ACTIONS)) {
+            if (!a?.action)
+                continue;
+            const pri = a.priority ? `${PRIORITY_LABEL[a.priority] ?? titleCase(a.priority)} — ` : "";
+            lines.push(`- ${pri}${escapeInline(a.action)}`);
         }
     }
     lines.push("");
     lines.push(`[Open the full run in Swarm →](${dashboardUrl})`);
     return lines.join("\n");
 }
+function renderFindingRow(b, hasArea) {
+    const cfg = TYPE_LABEL[b.type ?? ""] ?? { label: "Finding", emoji: "⚪", order: 99 };
+    const type = `${cfg.emoji} ${cfg.label}`;
+    const finding = escapeCell(b.headline ?? "(untitled)");
+    const agents = typeof b.agentCount === "number" && typeof b.totalAgents === "number"
+        ? `${b.agentCount}/${b.totalAgents}`
+        : "—";
+    if (!hasArea)
+        return `| ${type} | ${finding} | ${agents} |`;
+    const area = b.category ? CATEGORY_LABEL[b.category] ?? b.category : "—";
+    return `| ${type} | ${finding} | ${escapeCell(area)} | ${agents} |`;
+}
+function titleCase(s) {
+    return s.charAt(0).toUpperCase() + s.slice(1);
+}
+/** Sanitize text used outside a table cell (verdict, action) — strip backticks + newlines. */
+function escapeInline(s) {
+    return s.replace(/[\r\n]+/g, " ").replace(/`/g, "'").trim();
+}
+/** Sanitize a markdown table cell — also escape the pipe that would break the column. */
 function escapeCell(s) {
     return s.replace(/\|/g, "\\|").replace(/[\r\n]+/g, " ").replace(/`/g, "'").trim();
 }
@@ -44892,7 +44990,7 @@ async function run() {
         }
         const gate = evaluateGate(result, cfg.gate);
         try {
-            await channel.upsertSticky(prNumber, renderResultComment({ dashboardUrl: result.dashboardUrl, result: result, gate }));
+            await channel.upsertSticky(prNumber, renderResultComment({ dashboardUrl: result.dashboardUrl, result, gate }));
         }
         catch (e) {
             core.warning(`Could not post the result comment: ${e instanceof Error ? e.message : String(e)}`);

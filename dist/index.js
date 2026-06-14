@@ -43887,7 +43887,25 @@ const swarmConfigSchema = objectType({
         command: stringType().optional(),
         start: stringType().optional(),
         serveDir: stringType().optional(),
-        port: numberType().int().min(1024).max(65535).default(3000),
+        // Omit `port` to let Swarm pick a free port at runtime — your `start` command
+        // should bind to it via `$PORT` (e.g. `next start -p $PORT`). Set an explicit
+        // number only if your app can't take the port from $PORT/env.
+        port: numberType().int().min(1024).max(65535).optional(),
+        // Run a second server (e.g. an API) alongside the app and merge it through the
+        // SAME tunnel. The action starts it, waits for it to be healthy, routes `paths`
+        // to it, and tears it down with the app. Omit `paths` to use the proxy defaults
+        // (/api, /auth, /graphql, /trpc). Omit `port` to auto-pick a free one ($PORT).
+        backend: objectType({
+            command: stringType().optional(),
+            start: stringType().min(1),
+            port: numberType().int().min(1024).max(65535).optional(),
+            paths: arrayType(stringType().min(1)).optional(),
+            healthCheck: objectType({ path: stringType().default("/health"), timeoutSeconds: numberType().int().min(1).max(900).default(120) })
+                .default({ path: "/health", timeoutSeconds: 120 }),
+        })
+            .optional(),
+        // Deprecated: prefer `backend` above. These only MERGE an already-running
+        // backend through the tunnel — they do not start one.
         backendPort: numberType().int().min(1024).max(65535).optional(),
         backendPaths: arrayType(stringType().min(1)).optional(),
         healthCheck: objectType({ path: stringType().default("/"), timeoutSeconds: numberType().int().min(1).max(900).default(120) })
@@ -43928,6 +43946,18 @@ const swarmConfigSchema = objectType({
     }
     if (cfg.auth?.mode === "cookie_injection" && !cfg.auth.cookiesEnv) {
         ctx.addIssue({ code: ZodIssueCode.custom, message: "cookie_injection requires cookiesEnv" });
+    }
+    if (cfg.build?.backend) {
+        // Only a collision of two EXPLICIT ports is an error — omitted ports auto-allocate
+        // to distinct free ports, so they can't clash.
+        if (cfg.build.backend.port != null &&
+            cfg.build.port != null &&
+            cfg.build.backend.port === cfg.build.port) {
+            ctx.addIssue({ code: ZodIssueCode.custom, message: "build.backend.port must differ from build.port" });
+        }
+        if (cfg.build.backendPort != null) {
+            ctx.addIssue({ code: ZodIssueCode.custom, message: "Use either build.backend (preferred) or the legacy build.backendPort, not both" });
+        }
     }
 });
 function parseConfig(raw) {
@@ -44111,8 +44141,29 @@ function ensureCorepack(deps = {}) {
     }
 }
 
+;// CONCATENATED MODULE: external "node:net"
+const external_node_net_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:net");
 ;// CONCATENATED MODULE: ./src/app-process.ts
 
+
+/**
+ * Ask the OS for a free TCP port on loopback. Used when the user omits a `port` so we
+ * never assume a hardcoded one (and never collide with whatever else is running on the
+ * runner). There's a tiny TOCTOU window before the app binds it, which is fine on an
+ * ephemeral CI runner.
+ */
+function findFreePort() {
+    return new Promise((resolve, reject) => {
+        const srv = (0,external_node_net_namespaceObject.createServer)();
+        srv.unref();
+        srv.on("error", reject);
+        srv.listen(0, "127.0.0.1", () => {
+            const addr = srv.address();
+            const port = addr && typeof addr === "object" ? addr.port : 0;
+            srv.close(() => (port ? resolve(port) : reject(new Error("could not allocate a free port"))));
+        });
+    });
+}
 async function waitForHealthy(probe, opts) {
     const deadline = Date.now() + opts.timeoutMs;
     // eslint-disable-next-line no-constant-condition
@@ -44124,10 +44175,19 @@ async function waitForHealthy(probe, opts) {
         await new Promise((r) => setTimeout(r, opts.intervalMs));
     }
 }
-function httpProbe(port, healthPath) {
+function httpProbe(port, healthPath, opts = {}) {
+    // Frontends (default): a 404 at the health path means nothing is being served there —
+    // a static dir that doesn't exist, the wrong port, or an SSR app misconfigured as a
+    // static serve. Treat it as not-yet-healthy so the build fails fast ("did not become
+    // healthy") instead of billing a full agent run against 404s. Backends pass
+    // rejectNotFound:false — an API root may legitimately 404, so any HTTP response means
+    // the server is up. Either way 3xx redirects and 401/403 auth walls count as healthy.
+    const rejectNotFound = opts.rejectNotFound ?? true;
     return async () => {
         try {
             const res = await fetch(`http://127.0.0.1:${port}${healthPath}`, { redirect: "manual" });
+            if (rejectNotFound && res.status === 404)
+                return false;
             return res.status < 500;
         }
         catch {
@@ -44149,47 +44209,80 @@ function buildAppEnv(base) {
     }
     return env;
 }
-/**
- * Run install + build synchronously, then start the long-running app process
- * (or a static file server for serveDir). Resolves once the port is healthy.
- */
-async function startApp(cfg) {
-    if (cfg.install)
-        runBlocking(cfg.install);
-    if (cfg.command)
-        runBlocking(cfg.command);
+/** Spawn a single long-running server (a static file server for serveDir, or a `start` command). */
+function spawnServer(opts) {
+    // Every server gets PORT so its command can bind `$PORT` (or read it from env) — we
+    // never hardcode a port into the command. extraEnv carries BACKEND_URL/BACKEND_PORT
+    // so a frontend can reach the merged backend.
+    const env = { ...buildAppEnv(process.env), PORT: String(opts.port), ...(opts.extraEnv ?? {}) };
     let child;
-    if (cfg.serveDir) {
-        // `npx` is always present on GitHub runners; serve the static dir.
-        child = (0,external_node_child_process_namespaceObject.spawn)("npx", ["--yes", "serve", "-s", cfg.serveDir, "-l", String(cfg.port)], {
-            stdio: "inherit",
-            env: buildAppEnv(process.env),
-        });
+    if (opts.serveDir) {
+        // `npx` is always present on GitHub runners; serve the static dir on $PORT.
+        child = (0,external_node_child_process_namespaceObject.spawn)("npx", ["--yes", "serve", "-s", opts.serveDir, "-l", String(opts.port)], { stdio: "inherit", env });
     }
-    else if (cfg.start) {
-        child = (0,external_node_child_process_namespaceObject.spawn)("sh", ["-c", cfg.start], { stdio: "inherit", env: { ...buildAppEnv(process.env), PORT: String(cfg.port) } });
+    else if (opts.start) {
+        child = (0,external_node_child_process_namespaceObject.spawn)("sh", ["-c", opts.start], { stdio: "inherit", env });
     }
     else {
-        throw new Error("build config must define either `start` or `serveDir`");
+        throw new Error(`${opts.label} config must define either \`start\` or \`serveDir\``);
     }
     const stop = () => {
         if (!child.killed)
             child.kill("SIGTERM");
     };
+    return { child, stop };
+}
+/**
+ * Run install + build synchronously, then start the long-running app process (or a
+ * static file server for serveDir). When `cfg.backend` is set, start the backend first
+ * (so the app can reach it during boot/SSR), health-check it, then start the app.
+ * Resolves once every port is healthy; the returned `stop()` tears down all processes.
+ *
+ * Ports must already be resolved to concrete numbers (the caller auto-allocates any the
+ * user omitted) so probe + tunnel + the spawned commands all agree on the same port.
+ */
+async function startApp(cfg) {
+    // So a frontend build/start can target the merged backend without hardcoding its port.
+    const backendEnv = cfg.backend
+        ? { BACKEND_PORT: String(cfg.backend.port), BACKEND_URL: `http://127.0.0.1:${cfg.backend.port}` }
+        : {};
+    if (cfg.install)
+        runBlocking(cfg.install);
+    if (cfg.command)
+        runBlocking(cfg.command, backendEnv);
+    if (cfg.backend?.command)
+        runBlocking(cfg.backend.command);
+    const stoppers = [];
+    const stopAll = () => {
+        // Tear down in reverse start order — app first, then backend.
+        while (stoppers.length)
+            stoppers.pop()();
+    };
     try {
+        if (cfg.backend) {
+            const be = spawnServer({ start: cfg.backend.start, port: cfg.backend.port, label: "backend" });
+            stoppers.push(be.stop);
+            // Lenient probe: an API root may 404 — we only need the server listening.
+            await waitForHealthy(httpProbe(cfg.backend.port, cfg.backend.healthCheck.path, { rejectNotFound: false }), {
+                intervalMs: 1500,
+                timeoutMs: cfg.backend.healthCheck.timeoutSeconds * 1000,
+            });
+        }
+        const app = spawnServer({ start: cfg.start, serveDir: cfg.serveDir, port: cfg.port, label: "build", extraEnv: backendEnv });
+        stoppers.push(app.stop);
         await waitForHealthy(httpProbe(cfg.port, cfg.healthCheck.path), {
             intervalMs: 1500,
             timeoutMs: cfg.healthCheck.timeoutSeconds * 1000,
         });
+        return { child: app.child, stop: stopAll };
     }
     catch (e) {
-        stop();
+        stopAll();
         throw e;
     }
-    return { child, stop };
 }
-function runBlocking(command) {
-    const res = (0,external_node_child_process_namespaceObject.spawnSync)("sh", ["-c", command], { stdio: "inherit", env: buildAppEnv(process.env) });
+function runBlocking(command, extraEnv) {
+    const res = (0,external_node_child_process_namespaceObject.spawnSync)("sh", ["-c", command], { stdio: "inherit", env: { ...buildAppEnv(process.env), ...(extraEnv ?? {}) } });
     if (res.status !== 0) {
         throw new Error(`Command failed (exit ${res.status}): ${command}`);
     }
@@ -44938,11 +45031,32 @@ async function run() {
             // pnpm/yarn aren't on a hosted runner's PATH — enable Corepack so the
             // configured install/build commands resolve (npm builds are unaffected).
             ensureCorepack();
-            app = await startApp({ ...cfg.build });
+            // Resolve ports up front so the spawned commands, health probes, and the tunnel
+            // all agree on the same port. Any port the user omitted is auto-allocated to a
+            // free one — nothing is hardcoded. `$PORT` is passed to the commands.
+            const appPort = cfg.build.port ?? (await findFreePort());
+            // `backend` (preferred) both starts and merges a second server; the legacy
+            // backendPort/backendPaths only merge an already-running one.
+            let backendPort;
+            if (cfg.build.backend) {
+                backendPort = cfg.build.backend.port ?? (await findFreePort());
+                const paths = cfg.build.backend.paths ?? ["/api", "/auth", "/graphql", "/trpc"];
+                core.info(`Starting a backend on port ${backendPort}, merged into the same tunnel under ${paths.join(", ")}.`);
+            }
+            else {
+                backendPort = cfg.build.backendPort;
+            }
+            core.info(`Serving the app on port ${appPort}.`);
+            app = await startApp({
+                ...cfg.build,
+                port: appPort,
+                backend: cfg.build.backend ? { ...cfg.build.backend, port: backendPort } : undefined,
+            });
             await ensureCloudflared();
-            const tunnel = await tunnelTargetUrl(`http://127.0.0.1:${cfg.build.port}`, {
-                backendUrl: cfg.build.backendPort ? `http://127.0.0.1:${cfg.build.backendPort}` : undefined,
-                backendPaths: cfg.build.backendPaths,
+            const backendPaths = cfg.build.backend?.paths ?? cfg.build.backendPaths;
+            const tunnel = await tunnelTargetUrl(`http://127.0.0.1:${appPort}`, {
+                backendUrl: backendPort ? `http://127.0.0.1:${backendPort}` : undefined,
+                backendPaths,
                 persistentTunnel,
             });
             targetUrl = tunnel.url;

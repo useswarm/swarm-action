@@ -32,14 +32,31 @@ maxSteps: 30                      # optional cap per agent
 build:                            # used only when no preview URL is resolved
   install: "pnpm install --frozen-lockfile"
   command: "pnpm build"
-  start: "pnpm start"             # long-running; or set `serveDir` for static output
-  # serveDir: "dist"              # serve a static directory instead of `start`
-  port: 3000
-  # backendPort: 8080             # optional second port merged under backendPaths
-  backendPaths: ["/api", "/auth"] # extra path prefixes routed to backendPort
+  # Your server MUST listen on $PORT — Swarm picks a free port and probes/tunnels it
+  # (no hardcoded ports). Per framework:
+  #   Next.js:  start: "npx next start -p $PORT"
+  #   Vite/CRA: use `serveDir` below (static output, served on $PORT for you)
+  #   Node/etc: start: "node server.js"   # your app reads process.env.PORT
+  start: "npm start"
+  # serveDir: "dist"              # ...or serve a static output dir instead of `start`
+  # port: 3000                    # optional — omit to let Swarm auto-pick a free port
   healthCheck:
     path: "/"
     timeoutSeconds: 120
+  # Full-stack? Run an API alongside the app and merge it through the SAME tunnel, so the
+  # agent's browser reaches it same-origin under `paths`. Swarm builds + starts it, waits
+  # for it to be healthy, and tears it down with the app. The frontend can reach the API
+  # at $BACKEND_URL (injected into its build + start), or just call it same-origin (/api).
+  # A stateful backend still needs its own env/DB — provide those via the workflow
+  # `env:` / `services:`.
+  # backend:
+  #   command: "pnpm --filter api build"
+  #   start: "pnpm --filter api start"   # must bind $PORT
+  #   # port: 8080                        # optional — omit to auto-pick a free port
+  #   paths: ["/api", "/auth"]            # omit to use defaults: /api /auth /graphql /trpc
+  #   healthCheck:
+  #     path: "/health"                   # any non-5xx response = "up" (404 is fine)
+  #     timeoutSeconds: 120
 
 # ── Auth to the app under test ────────────────────────────────
 auth:
